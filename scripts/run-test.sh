@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
-USER1_USERNAME="$1"
-USER2_USERNAME="$2"
+LOG_DIR="$HOME"
 
-NR_OF_THREADS="$3"
-NR_OF_CALLABLES="$4"
-
-
+date_suffix=$(date +"%Y-%m-%dT%H_%M_%S");
 SELF="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}"; )" &> /dev/null && pwd 2> /dev/null; )";
-date_suffix=$(date +"%Y-%m-%dT%H_%M_%S")
-"${SELF}/run.sh" "${USER1_USERNAME}" "${USER2_USERNAME}" "${NR_OF_THREADS}" "${NR_OF_CALLABLES}" 2>&1 | tee ~/test-libpam4j-"${NR_OF_THREADS}"-threads-"${NR_OF_CALLABLES}"-callables-"${date_suffix}".log
+
+"${SELF}"/run.sh -s=login -e=100 -c=10000 \
+ -u=user1,user2,user3,user4,user5 \
+ -p=password1,password2,password3,password4,password5 \
+  2>&1 | tee "${LOG_DIR}/pam-authentication-test-${date_suffix}.log"

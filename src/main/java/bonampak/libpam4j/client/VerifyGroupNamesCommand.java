@@ -2,8 +2,11 @@ package bonampak.libpam4j.client;
 
 import org.jvnet.libpam.PAMException;
 import org.jvnet.libpam.UnixUser;
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
 
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -25,67 +28,46 @@ import java.util.stream.Collectors;
 
 import static java.util.stream.Collectors.toConcurrentMap;
 
-public class Main {
+@Command(name = "verifyGroupNames", mixinStandardHelpOptions = true, version = "verifyGroupNames 1.0",
+description = "Verifies the thread safety of user group names")
+public class VerifyGroupNamesCommand implements Callable<Integer> {
 
-    private static final Logger LOGGER = Logger.getLogger(Main.class.getName());
+    private static final Logger LOGGER = Logger.getLogger(VerifyGroupNamesCommand.class.getName());
+
+    @Option(names = {"-u", "--userNames"}, required = true, split = ",", description = "user1,user2, ...")
+    private List<String> userNames;
+
+    @Option(names = {"-e", "--executors"}, description = "number of threads, e.g. 50")
+    private int nrOfExecutors;
+
+    @Option(names = {"-c", "--callables"}, description = "number of calls, e.g. 1000")
+    int nrOfCallables;
+
     private static final BlockingQueue<UnixUser> unixUsersQueue = new LinkedBlockingDeque<>();
 
-    public static void main(String[] args) {
 
-        String userName1 = args[0];
-        String userName2 = args[1];
-        int nrOfExecutors = Integer.parseInt(args[2]);
-        int nrOfCallables = Integer.parseInt(args[3]);
-
-
-        LOGGER.info("username: " + userName1 +
-        ", userName2: " + userName2 +
-        ", nrOfExecutors: " + nrOfExecutors +
-        ", nrOfCallables: " + nrOfCallables);
-
+    @Override
+    public Integer call() throws Exception {
+        LOGGER.info("userNames:" + userNames + " executors:" + nrOfExecutors + " callables:" + nrOfCallables);
         int cores = Runtime.getRuntime().availableProcessors();
         LOGGER.info("available cores:" + cores);
 
-        UnixUser user1 = null;
-        try {
-            user1 = new UnixUser(userName1);
-        } catch (PAMException e) {
-            LOGGER.log(Level.SEVERE, "Exception caught", e);
-            System.exit(-1);
-        }
-        Set<String> groups1 = user1.getGroups();
-        LOGGER.info("user1 groups: " + groups1);
+        List<UnixUser> unixUsers = createUnixUsers();
 
-        UnixUser user2 = null;
-        try {
-            user2 = new UnixUser(userName2);
-        } catch (PAMException e) {
-            LOGGER.log(Level.SEVERE, "Exception caught", e);
-            System.exit(-1);
-        }
-        Set<String> groups2 = user2.getGroups();
-        LOGGER.info("user2 groups: " + groups2);
-
-        UserData userData = new UserData(Arrays.asList(user1, user2));
+        UserData userData = new UserData(unixUsers);
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
         final CompletionService<Boolean> service = new ExecutorCompletionService<>(pool);
 
-        service.submit(new Callable<Boolean>() {
-            @Override
-            public Boolean call() {
-                UnixUserConsumer consumer = new UnixUserConsumer(userData, nrOfExecutors, nrOfCallables, unixUsersQueue);
-                return consumer.consume();
-            }
+        service.submit(() -> {
+            UnixUserConsumer consumer = new UnixUserConsumer(userData, nrOfExecutors, nrOfCallables, unixUsersQueue);
+            return consumer.consume();
         });
 
 
-        service.submit(new Callable<Boolean>() {
-            @Override
-            public Boolean call() {
-                UnixUserProducer producer = new UnixUserProducer(userData, nrOfExecutors, nrOfCallables, unixUsersQueue);
-                return producer.offerUsers();
-            }
+        service.submit(() -> {
+            UnixUserProducer producer = new UnixUserProducer(userData, nrOfExecutors, nrOfCallables, unixUsersQueue);
+            return producer.produceUnixUsers();
         });
 
 
@@ -104,7 +86,22 @@ public class Main {
         } finally {
             pool.shutdownNow();
         }
+        return 0;
     }
+
+    private List<UnixUser> createUnixUsers() throws PAMException {
+        List<UnixUser> unixUsers = new ArrayList<>();
+        for (String username : userNames) {
+            try {
+                unixUsers.add(new UnixUser(username));
+            } catch (PAMException e) {
+                LOGGER.log(Level.SEVERE, "Exception caught for username:" + username, e);
+                throw e;
+            }
+        }
+        return unixUsers;
+    }
+
 
     private static class UserData {
         private final Map<String, UnixUser> usersByName;
@@ -131,8 +128,6 @@ public class Main {
             int idx = random.nextInt(nrOfUsers);
             return userNames.get(idx);
         }
-
-
     }
 
     private static class UnixUserProducer {
@@ -148,39 +143,43 @@ public class Main {
             this.userData = userData;
         }
 
-        public boolean offerUsers() {
-            ExecutorService pool = Executors.newFixedThreadPool(nrOfExecutors);
-            final CompletionService<UnixUser> service = new ExecutorCompletionService<>(pool);
-
-            for (int i = 0; i < nrOfCallables; i++) {
-                service.submit(new UserCallable(userData.getRandomUserName()));
-            }
-
+        public boolean produceUnixUsers() {
+            ExecutorService producerPool = Executors.newFixedThreadPool(nrOfExecutors);
+            final CompletionService<UnixUser> service = new ExecutorCompletionService<>(producerPool);
 
             try {
-                Future<UnixUser> future;
-
                 for (int i = 0; i < nrOfCallables; i++) {
-                    future = service.take();
-                    if (future != null) {
-                        UnixUser user = future.get();
-                        LOGGER.info("offering user " + user.getUserName() + " groups: " + user.getGroups());
-                        userQueue.offer(user);
-                    }
+                    service.submit(new CreateUserByNameCallable(userData.getRandomUserName()));
                 }
 
-                return true;
+                return takeAndOfferUsersToConsumerQueue(service);
             } catch (ExecutionException | InterruptedException ex) {
                 LOGGER.log(Level.SEVERE, "Exception caught", ex);
                 return false;
             } finally {
-                pool.shutdownNow();
+                producerPool.shutdownNow();
             }
+        }
+
+        private boolean takeAndOfferUsersToConsumerQueue(CompletionService<UnixUser> service) throws InterruptedException, ExecutionException {
+            Future<UnixUser> future;
+
+            for (int i = 0; i < nrOfCallables; i++) {
+                future = service.take();
+                if (future != null) {
+                    UnixUser user = future.get();
+                    LOGGER.info("offering user " + user.getUserName() + " groups: " + user.getGroups());
+                    userQueue.offer(user);
+                }
+            }
+
+            return true;
         }
     }
 
 
     private static class UnixUserConsumer {
+
         private final BlockingQueue<UnixUser> userQueue;
         private final UserData userData;
         private final int nrOfExecutors;
@@ -195,25 +194,15 @@ public class Main {
 
         public boolean consume() {
             LOGGER.info("starting consumer");
-            ExecutorService pool = Executors.newFixedThreadPool(nrOfExecutors);
-            final CompletionService<Boolean> service = new ExecutorCompletionService<>(pool);
+            ExecutorService consumerPool = Executors.newFixedThreadPool(nrOfExecutors);
+            final CompletionService<Boolean> service = new ExecutorCompletionService<>(consumerPool);
 
+            readQueueAndSubmitToConsumerPool(service);
+            return collectResultsFromConsumerPool(service, consumerPool);
 
+        }
 
-            int receivedUsers = 0;
-            while (receivedUsers < nrOfCallables) {
-                UnixUser user = null;
-                try {
-                    user = userQueue.take();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                receivedUsers++;
-                LOGGER.info("consumer got "+user.getUserName()+" with groups "+user.getGroups());
-                service.submit(new UserCheckCallable(user, userData));
-            }
-
-
+        private boolean collectResultsFromConsumerPool(CompletionService<Boolean> service, ExecutorService consumerPool) {
             try {
                 Future<Boolean> future;
                 int nrOfErrors = 0;
@@ -228,17 +217,29 @@ public class Main {
                     }
                 }
                 if (nrOfErrors > 0) {
-                    LOGGER.log(Level.INFO, "Found " + nrOfErrors + " invalid user responses.");
+                    LOGGER.log(Level.INFO, "Found " + nrOfErrors + " invalid users.");
                 }
-
                 return true;
             } catch (ExecutionException | InterruptedException ex) {
                 LOGGER.log(Level.SEVERE, "Exception caught", ex);
                 return false;
             } finally {
-                pool.shutdownNow();
+                consumerPool.shutdownNow();
             }
+        }
 
+        private void readQueueAndSubmitToConsumerPool(CompletionService<Boolean> service) {
+            int receivedUsers = 0;
+            while (receivedUsers < nrOfCallables) {
+                try {
+                    UnixUser user = userQueue.take();
+                    receivedUsers++;
+                    LOGGER.info("consumer got " + user.getUserName() + " with groups " + user.getGroups());
+                    service.submit(new UserCheckCallable(user, userData));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
 
     }
@@ -273,11 +274,11 @@ public class Main {
         }
     }
 
-    private static class UserCallable implements Callable<UnixUser> {
+    private static class CreateUserByNameCallable implements Callable<UnixUser> {
 
         private final String userName;
 
-        public UserCallable(String userName) {
+        public CreateUserByNameCallable(String userName) {
             this.userName = userName;
         }
 
@@ -287,4 +288,8 @@ public class Main {
         }
     }
 
+    public static void main(String... args) {
+        int exitCode = new CommandLine(new VerifyGroupNamesCommand()).execute(args);
+        System.exit(exitCode);
+    }
 }
